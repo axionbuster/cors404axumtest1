@@ -1,8 +1,10 @@
 //! Test whether the CORS (Access-Control-Allow-Origin) header is set correctly
 //! even when the response fails.
 
+use axum::body::Body;
 use axum::extract::Path;
-use axum::http::{Method, StatusCode};
+use axum::http::{Method, Request, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use thiserror::Error;
@@ -23,15 +25,49 @@ enum AppError {
 }
 
 // Allows being returned by a handler.
+//
+// It also reveals the error to the client.
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         match self {
-            AppError::NotFound(_e) => (StatusCode::NOT_FOUND, "Not Found").into_response(),
-            AppError::InternalServerError(_e) => {
-                (StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error").into_response()
+            AppError::NotFound(e) => {
+                (StatusCode::NOT_FOUND, format!("Not Found: {e}")).into_response()
+            }
+            AppError::InternalServerError(e) => {
+                (StatusCode::INTERNAL_SERVER_ERROR, format!("ISE: {e}")).into_response()
             }
         }
     }
+}
+
+mod gstate {
+    //! Quick-and-dirty global state.
+
+    use tokio::sync::OnceCell;
+
+    /// Should the pre-middleware break?
+    pub static PREBREAK: OnceCell<bool> = OnceCell::const_new();
+
+    /// Should the post-middleware break?
+    pub static POSTBREAK: OnceCell<bool> = OnceCell::const_new();
+}
+
+/// Error-Injecting Middleware.
+///
+/// Configure the PREBREAK and POSTBREAK global variables to break the middleware.
+async fn errinjmw(request: Request<Body>, next: Next<Body>) -> Result<impl IntoResponse, AppError> {
+    if *gstate::PREBREAK.get_or_init(|| async move { false }).await {
+        return Err(AppError::InternalServerError(anyhow::anyhow!(
+            "Pre-Middleware Break"
+        )));
+    }
+    let response = next.run(request).await;
+    if *gstate::POSTBREAK.get_or_init(|| async move { false }).await {
+        return Err(AppError::InternalServerError(anyhow::anyhow!(
+            "Post-Middleware Break"
+        )));
+    }
+    Ok(response)
 }
 
 /// A handler that returns "200 OK" when the path is "200,"
@@ -64,8 +100,7 @@ async fn main() -> Result<(), &'static str> {
 
     // If the environment variable RUST_LOG isn't set, let the user know
     // how to access the HTTP logs by setting it to DEBUG.
-    let rust_log = std::env::var("RUST_LOG");
-    match rust_log {
+    match std::env::var("RUST_LOG") {
         Ok(rust_log) => {
             // If set, let them know.
             info!("RUST_LOG={}", rust_log);
@@ -76,7 +111,7 @@ async fn main() -> Result<(), &'static str> {
             // Any other error: let them know.
             match e {
                 std::env::VarError::NotPresent => {
-                    warn!("Set RUST_LOG=DEBUG to see HTTP logs.");
+                    info!("Set RUST_LOG=DEBUG to see HTTP logs.");
                 }
                 _ => {
                     error!("Error getting RUST_LOG: {}", e);
@@ -90,10 +125,29 @@ async fn main() -> Result<(), &'static str> {
     let port = match std::env::args().nth(1) {
         Some(port) => port,
         None => {
-            warn!("Port not set. Defaulting to 3000. (Set as first argument.)");
+            info!("Port not set. Defaulting to 3000. (Set as first argument.)");
             "3000".to_string()
         }
     };
+
+    // For both middlewares, check for the respective environment variable.
+    let prebreak = std::env::var_os("PREBREAK");
+    if prebreak.is_some() {
+        info!("Pre-Middleware Break is set: it will fail.");
+        gstate::PREBREAK.set(true).unwrap();
+    } else {
+        info!("Pre-Middleware Break is not set. Set it using PREBREAK env var.");
+    }
+    let postbreak = std::env::var_os("POSTBREAK");
+    if postbreak.is_some() {
+        info!("Post-Middleware Break is set: it will fail.");
+        gstate::POSTBREAK.set(true).unwrap();
+    } else {
+        info!("Post-Middleware Break is not set. Set it using POSTBREAK env var.");
+    }
+    if prebreak.is_some() && postbreak.is_some() {
+        warn!("Both PREBREAK and POSTBREAK are set. This is weird.");
+    }
 
     // CORS Layer. Allow listening on any origin, GET requests.
     let cors = tower_http::cors::CorsLayer::new()
@@ -107,6 +161,8 @@ async fn main() -> Result<(), &'static str> {
         .route("/:code", get(handler))
         .route("/", get(handler))
         // Note: fallback is not used to enable testing unhandled routing.
+        // Inject errors at the middleware level.
+        .layer(middleware::from_fn(errinjmw))
         // Add a CORS middleware.
         .layer(cors)
         // Add tracing logging.
@@ -125,6 +181,10 @@ async fn main() -> Result<(), &'static str> {
         .serve(app.into_make_service())
         .await;
     if let Err(ref e) = future {
+        // Unreliable way to catch most errors.
+        // For example, if there's a problem with the networking, say,
+        // the port is already in use, it will PANIC instead of getting
+        // caught here. This is a limitation of the library.
         error!("Failure to launch: {e}");
         return Err("Bad Launch");
     }
