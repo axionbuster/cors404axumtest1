@@ -1,6 +1,8 @@
 //! Test whether the CORS (Access-Control-Allow-Origin) header is set correctly
 //! even when the response fails.
 
+use std::time::Duration;
+
 use axum::body::Body;
 use axum::extract::Path;
 use axum::http::{Method, Request, StatusCode};
@@ -8,15 +10,16 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use thiserror::Error;
-use tracing::{error, info, warn};
+use tower_http::classify::ServerErrorsFailureClass;
+use tracing::{debug, error, info, warn, Span};
 
 /// An error type that implements axum::IntoResponse.
 /// This allows any HTTP errors to be directly thrown by the handler.
 #[derive(Debug, Error)]
 enum AppError {
-    #[error("Not Found")]
+    #[error("!Not Found")]
     NotFound(#[source] anyhow::Error),
-    #[error("Internal Server Error")]
+    #[error("!ISE")]
     InternalServerError(
         #[from]
         #[source]
@@ -31,11 +34,49 @@ impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         match self {
             AppError::NotFound(e) => {
-                (StatusCode::NOT_FOUND, format!("Not Found: {e}")).into_response()
+                (StatusCode::NOT_FOUND, format!("!Not Found: {e}")).into_response()
             }
             AppError::InternalServerError(e) => {
-                (StatusCode::INTERNAL_SERVER_ERROR, format!("ISE: {e}")).into_response()
+                (StatusCode::INTERNAL_SERVER_ERROR, format!("!ISE: {e}")).into_response()
             }
+        }
+    }
+}
+
+/// Don't log 404s at the ERROR level. But do log 500s.
+fn nolog404(fc: ServerErrorsFailureClass, duration: Duration, span: &Span) {
+    // Tower HTTP has made a decision to flatten Error's to String's.
+    // Hence, the misfortune of having to inspect the string inside it.
+    match fc {
+        ServerErrorsFailureClass::StatusCode(c) => {
+            if c.is_client_error() {
+                // Log 4xx's at the DEBUG level.
+                debug!(
+                    parent: span,
+                    "request failed with \"{}\" in {:?}", c, duration
+                );
+                return;
+            }
+            // Log 500s.
+            error!(
+                parent: span,
+                "request failed with \"{}\" in {:?}", c, duration
+            );
+        }
+        ServerErrorsFailureClass::Error(s) => {
+            // See if it begins with our sigature, "!Not Found". Then debug.
+            // Otherwise, error.
+            if s.starts_with("!Not Found") {
+                debug!(
+                    parent: span,
+                    "request failed with \"{}\" in {:?}", s, duration
+                );
+                return;
+            }
+            error!(
+                parent: span,
+                "request failed with \"{}\" in {:?}", s, duration
+            );
         }
     }
 }
@@ -166,7 +207,7 @@ async fn main() -> Result<(), &'static str> {
         // Add a CORS middleware.
         .layer(cors)
         // Add tracing logging.
-        .layer(tower_http::trace::TraceLayer::new_for_http());
+        .layer(tower_http::trace::TraceLayer::new_for_http().on_failure(nolog404));
 
     // Let's go
     let str_bind_to = format!("0.0.0.0:{port}");
