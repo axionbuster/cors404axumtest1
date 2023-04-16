@@ -171,7 +171,8 @@ async fn main() -> Result<(), &'static str> {
         }
     };
 
-    // For both middlewares, check for the respective environment variable.
+    // Configure failure injection.
+    // For both injections, check for the respective environment variable.
     let prebreak = std::env::var_os("PREBREAK");
     if prebreak.is_some() {
         info!("Pre-Middleware Break is set: it will fail.");
@@ -198,7 +199,6 @@ async fn main() -> Result<(), &'static str> {
     // Create a new router.
     let app = axum::Router::new()
         // Add a route that matches any request to "/:code" and calls the handler.
-        // Actually, match everything.
         .route("/:code", get(handler))
         .route("/", get(handler))
         // Note: fallback is not used to enable testing unhandled routing.
@@ -206,7 +206,7 @@ async fn main() -> Result<(), &'static str> {
         .layer(middleware::from_fn(errinjmw))
         // Add a CORS middleware.
         .layer(cors)
-        // Add tracing logging.
+        // Add tracing logging with our logging policy.
         .layer(tower_http::trace::TraceLayer::new_for_http().on_failure(nolog404));
 
     // Let's go
